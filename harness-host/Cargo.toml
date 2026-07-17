@@ -1,0 +1,14 @@
+[package]
+name = "harness-host"
+version = "0.1.0"
+edition = "2021"
+description = "Orchestrates a payjoin round trip between two boards over serial"
+
+[dependencies]
+harness-proto = { path = "../harness-proto" }
+serialport = "4.3"
+anyhow = "1"
+
+[[bin]]
+name = "harness-host"
+path = "src/bin/harness-host.rs"
