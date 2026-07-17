@@ -1,0 +1,11 @@
+[workspace]
+resolver = "2"
+members = ["harness-proto", "harness-host", "harness-device"]
+
+# harness-device is intentionally NOT a member of this workspace. It's a
+# no_std crate that cross-compiles for embedded targets and pulls in
+# payjoin (which requires a newer Cargo resolver for its own workspace).
+# Keeping it out avoids forcing every host-side `cargo build` to resolve
+# that graph too. It's a standalone crate with its own Cargo.toml; build
+# it directly from harness-device/, the same way payjoin-blackpill-test /
+# payjoin-pico2 build their firmware.

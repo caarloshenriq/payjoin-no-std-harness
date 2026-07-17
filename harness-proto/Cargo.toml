@@ -1,0 +1,7 @@
+[package]
+name = "harness-proto"
+version = "0.1.0"
+edition = "2021"
+description = "Length-prefixed framing protocol shared by harness-host and harness-device"
+
+[dependencies]
