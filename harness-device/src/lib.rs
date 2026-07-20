@@ -359,10 +359,7 @@ mod tests {
         let mut filled = 0usize;
 
         let err = recv_frame(&mut transport, &mut read_buf, &mut filled).unwrap_err();
-        assert!(matches!(
-            err,
-            HarnessError::Framing(harness_proto::DecodeError::PayloadTooLarge)
-        ));
+        assert!(matches!(err, HarnessError::Framing(harness_proto::DecodeError::PayloadTooLarge)));
     }
 
     #[test]
