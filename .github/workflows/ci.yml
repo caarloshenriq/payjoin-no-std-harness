@@ -1,0 +1,95 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: fmt, clippy, codespell, nix fmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: DeterminateSystems/magic-nix-cache-action@main
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            .
+            harness-device
+
+      # contrib/lint.sh covers fmt --check, clippy --all-targets
+      # --all-features, and codespell for the workspace (harness-proto,
+      # harness-host). See CONTRIBUTING.md for the tiers this mirrors.
+      - name: contrib/lint.sh (workspace)
+        run: nix develop -c ./contrib/lint.sh
+
+      # harness-device is intentionally outside the workspace (see
+      # README, "Crates"), so it needs its own clippy pass.
+      - name: clippy (harness-device)
+        run: |
+          nix develop -c bash -c '
+            cd harness-device &&
+            cargo clippy --all-targets --all-features -- -D warnings
+          '
+
+      - name: nix fmt --ci
+        run: nix develop -c nix fmt -- --ci
+
+  test-workspace:
+    name: test (harness-proto, harness-host)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: DeterminateSystems/magic-nix-cache-action@main
+      - uses: Swatinem/rust-cache@v2
+      - run: nix develop -c cargo test --workspace
+
+  test-device:
+    name: test harness-device (host target)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: DeterminateSystems/magic-nix-cache-action@main
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: harness-device
+
+      # Runs on the host target (not thumbv7em) using the crate's
+      # `#![cfg_attr(not(test), no_std)]` escape hatch, so the real payjoin
+      # sender/receiver round trip and the ShortId/mailbox probe get
+      # exercised with std tools (threads, channels) without hardware.
+      - run: |
+          nix develop -c bash -c '
+            cd harness-device &&
+            cargo test
+          '
+
+  build-embedded:
+    name: build harness-device (thumbv7em-none-eabihf)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: DeterminateSystems/magic-nix-cache-action@main
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: harness-device
+
+      # This is the check that actually matters for PR #1615: proving the
+      # no_std build still compiles for real hardware, not just that it
+      # passes on the host target above.
+      - run: |
+          nix develop .#embedded -c bash -c '
+            cd harness-device &&
+            cargo build --release --target thumbv7em-none-eabihf \
+              -Zbuild-std=core,alloc \
+              --no-default-features --features alloc,v1,v2
+          '
