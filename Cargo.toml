@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["harness-proto", "harness-host", "harness-device"]
+members = ["harness-proto", "harness-host"]
 
 # harness-device is intentionally NOT a member of this workspace. It's a
 # no_std crate that cross-compiles for embedded targets and pulls in

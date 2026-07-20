@@ -6,4 +6,4 @@ edition = "2021"
 [dependencies]
 harness-proto = { path = "../harness-proto" }
 payjoin = { git = "https://github.com/caarloshenriq/rust-payjoin", branch = "feat/payjoin-nostd", default-features = false, features = ["alloc", "v1", "v2"] }
-bitcoin = { version = "0.32", default-features = false }
+bitcoin = { version = "^0.32.9", default-features = false }

@@ -7,7 +7,8 @@ description = "Orchestrates a payjoin round trip between two boards over serial"
 [dependencies]
 harness-proto = { path = "../harness-proto" }
 serialport = "4.3"
-anyhow = "1"
+anyhow = "1.0.81"
+pkg-config = "0.3.30"
 
 [[bin]]
 name = "harness-host"
