@@ -387,6 +387,7 @@ mod tests {
     /// pushes one chunk; `recv` drains the oldest pending chunk into
     /// `buf`, splitting it across multiple `recv` calls if `buf` is
     /// smaller than the chunk.
+    #[allow(dead_code)]
     struct ChannelTransport {
         tx: mpsc::Sender<Vec<u8>>,
         rx: mpsc::Receiver<Vec<u8>>,
