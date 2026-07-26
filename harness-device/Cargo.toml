@@ -13,3 +13,4 @@ payjoin = { git = "https://github.com/caarloshenriq/rust-payjoin", branch = "fea
   "v2",
 ] }
 bitcoin = { version = "^0.32.9", default-features = false }
+base64 = { version = "0.21.7", default-features = false, features = ["alloc"] }

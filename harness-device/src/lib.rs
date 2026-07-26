@@ -24,11 +24,21 @@
 extern crate alloc;
 
 use alloc::string::{String, ToString};
+use alloc::vec;
 use alloc::vec::Vec;
+use core::str::FromStr;
 
+use bitcoin::absolute::LockTime;
+use bitcoin::hashes::Hash;
 use bitcoin::psbt::Psbt;
-use bitcoin::{Address, Amount, FeeRate};
+use bitcoin::transaction::Version;
+use bitcoin::{
+    Address, Amount, FeeRate, Network, OutPoint, Sequence, Transaction, TxIn, TxOut, Txid,
+    WPubkeyHash, Witness,
+};
 use harness_proto::{decode, encode, Command};
+use payjoin::bitcoin::hashes::{sha256, HashEngine};
+use payjoin::directory::ShortId;
 use payjoin::receive::v1::{Headers, UncheckedOriginalPayload};
 use payjoin::send::v1::SenderBuilder;
 use payjoin::PjParam;
@@ -252,11 +262,106 @@ pub fn run_receiver<T: Transport>(
 
     let proposal_psbt = payjoin_proposal.psbt().clone();
 
-    let response_bytes = proposal_psbt.serialize();
+    // FIX: process_response (called on the sender side, in run_sender)
+    // expects base64-encoded text, not raw PSBT bytes. Serializing alone
+    // and sending that produced a response the sender could never parse.
+    // Found by tracing an actual hardware round trip: the device reported
+    // success (send_frame returned Ok) but sender-sim never received a
+    // decodable response until this was applied on the wire-encoding side.
+    use base64::Engine;
+    let response_bytes =
+        base64::engine::general_purpose::STANDARD.encode(proposal_psbt.serialize());
+
     let mut scratch = [0u8; harness_proto::MAX_PAYLOAD_LEN + harness_proto::FRAME_OVERHEAD];
-    send_frame(transport, Command::SignedPsbt, &response_bytes, &mut scratch)?;
+    send_frame(transport, Command::SignedPsbt, response_bytes.as_bytes(), &mut scratch)?;
 
     Ok(proposal_psbt)
+}
+
+/// The `v2` slice of the protocol this crate can actually run standalone
+/// on bare-metal: [`ShortId`] round-tripping and SHA256-based mailbox
+/// derivation, per `payjoin-blackpill-test`'s `run_payjoin_tests`
+/// (proven passing on a real STM32F411CEU6, `thumbv7em-none-eabihf`).
+///
+/// This deliberately does **not** attempt a live `receive::v2` receiver
+/// session. Per that repo's own README: "The full `receive::v2` receiver
+/// state machine is gated on `v2-ohttp` (requires `std`). A live receiver
+/// session is not possible on bare-metal." `session_context` -- and the
+/// OHTTP encapsulate/decapsulate calls it carries through every
+/// transition, all the way to `finalize_proposal` -- has no `no_std` path
+/// today. Anything claiming to run a full v2 receiver on-device would be
+/// wrong; this only exercises the primitive that is genuinely no_std-safe.
+pub fn shortid_of(seed: &[u8]) -> ShortId {
+    let mut engine = sha256::HashEngine::default();
+    engine.input(seed);
+    let hash = sha256::Hash::from_engine(engine);
+    ShortId::from(hash)
+}
+
+/// Run the v2 probe role: wait for the host to relay seed bytes (reusing
+/// [`Command::OriginalPsbt`] -- there's no v2-specific opcode yet, this
+/// isn't really "the original PSBT", just whatever the host wants hashed),
+/// compute the [`ShortId`] the same way `payjoin-blackpill-test` does, and
+/// send the bech32m-encoded id back over [`Command::SignedPsbt`].
+///
+/// This exists so the harness can validate the same primitive on real
+/// hardware through the serial framing, rather than only as a bare
+/// `main()` with no host round trip at all (which is all
+/// `payjoin-blackpill-test` does today).
+pub fn run_v2_probe<T: Transport>(transport: &mut T) -> Result<String, HarnessError<T::Error>> {
+    let mut read_buf = [0u8; harness_proto::MAX_PAYLOAD_LEN + harness_proto::FRAME_OVERHEAD];
+    let mut filled = 0usize;
+    let (command, seed) = recv_frame(transport, &mut read_buf, &mut filled)?;
+    if command != Command::OriginalPsbt {
+        return Err(HarnessError::UnexpectedCommand);
+    }
+
+    let id = shortid_of(&seed);
+    let encoded = alloc::format!("{id}");
+
+    let mut scratch = [0u8; harness_proto::MAX_PAYLOAD_LEN + harness_proto::FRAME_OVERHEAD];
+    send_frame(transport, Command::SignedPsbt, encoded.as_bytes(), &mut scratch)?;
+
+    Ok(encoded)
+}
+
+/// A minimal, self-contained original PSBT: one input (with witness_utxo
+/// so BIP78 checks pass) funding two outputs, the second of which is the
+/// receiver's own address -- same shape as payjoin/tests/e2e.rs's
+/// fixture, built locally instead of pulling `payjoin-test-utils` (which
+/// drags in testcontainers-modules/tokio and a transitive dependency
+/// tree that outran rustc 1.85).
+///
+/// Public (not test-only) so both this crate's own tests and any
+/// external tool driving `run_sender`/`run_receiver` against a real
+/// device over a real transport (see e.g. sender-sim) can use the exact
+/// same fixture without duplicating it.
+pub fn original_psbt_fixture() -> (Psbt, Address) {
+    let sender_script = bitcoin::ScriptBuf::new_p2wpkh(&WPubkeyHash::from_byte_array([0x11; 20]));
+    let receiver_script = bitcoin::ScriptBuf::new_p2wpkh(&WPubkeyHash::from_byte_array([0x22; 20]));
+    let receiver_address = Address::from_script(&receiver_script, Network::Testnet)
+        .expect("p2wpkh script should map to a valid address");
+
+    let tx = Transaction {
+        version: Version::TWO,
+        lock_time: LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint { txid: Txid::from_str(&"11".repeat(32)).unwrap(), vout: 0 },
+            script_sig: bitcoin::ScriptBuf::new(),
+            sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+            witness: Witness::new(),
+        }],
+        output: vec![
+            TxOut { value: Amount::from_sat(90_000), script_pubkey: sender_script.clone() },
+            TxOut { value: Amount::from_sat(50_000), script_pubkey: receiver_script },
+        ],
+    };
+
+    let mut psbt = Psbt::from_unsigned_tx(tx).unwrap();
+    psbt.inputs[0].witness_utxo =
+        Some(TxOut { value: Amount::from_sat(150_000), script_pubkey: sender_script });
+
+    (psbt, receiver_address)
 }
 
 #[cfg(test)]
@@ -374,6 +479,49 @@ mod tests {
         assert_eq!(frame.payload, b"proposal bytes");
     }
 
+    #[test]
+    fn v2_shortid_round_trip_over_transport() {
+        // Same seed and assertions as payjoin-blackpill-test's
+        // run_payjoin_tests, just driven over the harness framing instead
+        // of called directly from main().
+        let seed = b"payjoin-blackpill-test";
+        let host_frame = encode_frame(Command::OriginalPsbt, seed);
+        let mut transport = QueueTransport::preloaded(&host_frame, 1024);
+
+        let encoded = run_v2_probe(&mut transport).unwrap();
+
+        let expected = shortid_of(seed);
+        assert_eq!(encoded, alloc::format!("{expected}"));
+
+        // Round-trip through Display/FromStr, exactly like the hardware
+        // test's round_trip_ok check.
+        let decoded: ShortId = encoded.parse().expect("encoded id should parse back");
+        assert_eq!(decoded, expected);
+
+        // And confirm what actually went out over the wire matches.
+        let (frame, _) = decode(&transport.written).unwrap();
+        assert_eq!(frame.command, Command::SignedPsbt);
+        assert_eq!(frame.payload, encoded.as_bytes());
+    }
+
+    #[test]
+    fn v2_mailbox_id_is_nonempty() {
+        // Mirrors the hardware test's second check: a different seed
+        // (standing in for an OHTTP-keys hash) still produces a
+        // non-empty encoded mailbox id.
+        let id = shortid_of(b"ohttp-keys-hash");
+        assert!(!alloc::format!("{id}").is_empty());
+    }
+
+    #[test]
+    fn v2_probe_rejects_wrong_command() {
+        let host_frame = encode_frame(Command::Status, &[0x00]);
+        let mut transport = QueueTransport::preloaded(&host_frame, 1024);
+
+        let err = run_v2_probe(&mut transport).unwrap_err();
+        assert!(matches!(err, HarnessError::UnexpectedCommand));
+    }
+
     // ------------------------------------------------------------------
     // Full round-trip test: real payjoin crypto, two real threads (one
     // per role) connected by a channel-backed Transport, standing in for
@@ -382,23 +530,46 @@ mod tests {
     // ------------------------------------------------------------------
 
     use std::sync::mpsc;
+    use std::thread;
+
+    /// Splits a full request URL into its query string, the way a device
+    /// would after receiving `Request.url` from the host relay.
+    fn query_of(url: &str) -> &str { url.split('?').nth(1).unwrap_or("") }
 
     /// Duplex byte transport backed by a pair of `mpsc` channels. `send`
     /// pushes one chunk; `recv` drains the oldest pending chunk into
     /// `buf`, splitting it across multiple `recv` calls if `buf` is
     /// smaller than the chunk.
-    #[allow(dead_code)]
+    ///
+    /// Also translates the command tag on send, exactly like
+    /// harness-host's `run_v1_roundtrip` does when relaying between two
+    /// real boards: `run_sender` emits `OutRequest`, but `run_receiver`
+    /// only accepts `OriginalPsbt`; `run_receiver` responds with
+    /// `SignedPsbt`, but `run_sender` only accepts `InResponse`. Without
+    /// this, wiring `run_sender` and `run_receiver` directly together (no
+    /// host in between) always fails with `UnexpectedCommand` -- this is
+    /// exactly the bug `sender-sim` had before the same fix was applied
+    /// there.
     struct ChannelTransport {
         tx: mpsc::Sender<Vec<u8>>,
         rx: mpsc::Receiver<Vec<u8>>,
         pending: Vec<u8>,
+        translate_outgoing: fn(Command) -> Command,
     }
 
     impl Transport for ChannelTransport {
         type Error = String;
 
         fn send(&mut self, bytes: &[u8]) -> Result<(), Self::Error> {
-            self.tx.send(bytes.to_vec()).map_err(|e| e.to_string())
+            let (frame, _) = decode(bytes).map_err(|e| alloc::format!("{e:?}"))?;
+            let translated_command = (self.translate_outgoing)(frame.command);
+            let payload = frame.payload.to_vec();
+
+            let mut scratch = vec![0u8; payload.len() + harness_proto::FRAME_OVERHEAD];
+            let written = encode(translated_command, &payload, &mut scratch)
+                .map_err(|e| alloc::format!("{e:?}"))?;
+
+            self.tx.send(scratch[..written].to_vec()).map_err(|e| e.to_string())
         }
 
         fn recv(&mut self, buf: &mut [u8]) -> Result<usize, Self::Error> {
@@ -410,5 +581,98 @@ mod tests {
             self.pending.drain(..n);
             Ok(n)
         }
+    }
+
+    fn channel_pair() -> (ChannelTransport, ChannelTransport) {
+        let (tx_a, rx_a) = mpsc::channel();
+        let (tx_b, rx_b) = mpsc::channel();
+        (
+            ChannelTransport {
+                tx: tx_a,
+                rx: rx_b,
+                pending: Vec::new(),
+                // sender side: OutRequest -> OriginalPsbt on the way out
+                translate_outgoing: |c| {
+                    if c == Command::OutRequest {
+                        Command::OriginalPsbt
+                    } else {
+                        c
+                    }
+                },
+            },
+            ChannelTransport {
+                tx: tx_b,
+                rx: rx_a,
+                pending: Vec::new(),
+                // receiver side: SignedPsbt -> InResponse on the way out
+                translate_outgoing: |c| {
+                    if c == Command::SignedPsbt {
+                        Command::InResponse
+                    } else {
+                        c
+                    }
+                },
+            },
+        )
+    }
+
+    #[test]
+    fn v1_round_trip_over_real_transport() {
+        let (original_psbt, receiver_address) = original_psbt_fixture();
+        let receiver_script = original_psbt.unsigned_tx.output[1].script_pubkey.clone();
+
+        let pj_param = match PjParam::parse("https://example.com/").unwrap() {
+            payjoin::PjParam::V1(v1_param) => v1_param,
+            _ => panic!("expected a v1 PjParam"),
+        };
+
+        // The receiver device needs the query string up front (it's
+        // configuration the host would supply, not something learned
+        // from the wire in this protocol). Since it's derived
+        // deterministically from the same PjParam the sender uses, this
+        // reruns the same request-building step run_sender does
+        // internally just to read it off -- not a guess, the exact code
+        // path proven in e2e.rs's `mod v1` test.
+        let probe_sender =
+            SenderBuilder::from_parts(original_psbt.clone(), &pj_param, &receiver_address, None)
+                .build_with_additional_fee(Amount::from_sat(182), Some(0), FeeRate::ZERO, true)
+                .unwrap();
+        let (probe_request, _) = probe_sender.create_v1_post_request();
+        let query = query_of(&probe_request.url).to_string();
+
+        let (sender_transport, receiver_transport) = channel_pair();
+
+        let sender_handle = thread::spawn({
+            let original_psbt = original_psbt.clone();
+            let receiver_address = receiver_address.clone();
+            let mut sender_transport = sender_transport;
+            move || {
+                run_sender(
+                    &mut sender_transport,
+                    original_psbt,
+                    "https://example.com/",
+                    &receiver_address,
+                    Amount::from_sat(182),
+                )
+            }
+        });
+
+        let receiver_handle = thread::spawn({
+            let receiver_script = receiver_script.clone();
+            let mut receiver_transport = receiver_transport;
+            move || {
+                run_receiver(&mut receiver_transport, &query, move |script: &bitcoin::Script| {
+                    script == receiver_script.as_script()
+                })
+            }
+        });
+
+        let proposal_psbt =
+            receiver_handle.join().expect("receiver thread panicked").expect("run_receiver failed");
+        let final_psbt =
+            sender_handle.join().expect("sender thread panicked").expect("run_sender failed");
+
+        assert_eq!(final_psbt, proposal_psbt);
+        assert!(final_psbt.unsigned_tx.output.len() >= 2);
     }
 }

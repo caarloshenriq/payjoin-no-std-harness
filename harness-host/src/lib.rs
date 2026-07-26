@@ -12,23 +12,41 @@
 //! so this can be validated against real hardware first; the regtest
 //! orchestration itself doesn't need hardware to develop against.
 //!
-//! NOTE: this orchestration is v1-only. It assumes both endpoints are
-//! boards running the full sender/receiver payjoin logic themselves, and
-//! the host is a dumb relay between them. v2 doesn't fit this shape --
-//! there the host itself plays the sender role and does OHTTP
-//! encapsulation/decapsulation, with only the receiver on a board. That
-//! needs its own orchestration function (and likely its own `--mode`
-//! flag on this binary), not a generalization of `run_v1_roundtrip`.
+//! Two orchestration modes live here:
+//!
+//! - v1 (`run_v1_roundtrip`): two boards, host relays frames between them,
+//!   zero payjoin awareness on the host's part.
+//! - v2 probe (`run_v2_probe`): one board, host hands it seed bytes and
+//!   reports back the ShortId it computed (see harness-device's
+//!   `run_v2_probe` docs for why this is a primitive-level probe, not a
+//!   live v2 receiver session -- that's not possible on bare-metal today).
+//!   Still zero payjoin awareness on the host: it doesn't independently
+//!   verify the ShortId is correct, since doing that would mean pulling in
+//!   `payjoin` as a host dependency, which is exactly the resolver
+//!   complexity keeping `harness-device` out of this workspace in the
+//!   first place. It only confirms the round trip happened and reports
+//!   what the device said.
 
 use std::io::{Read, Write};
 
 use anyhow::{bail, Context, Result};
 use harness_proto::{decode, Command, DecodeError};
 
+#[derive(Debug, PartialEq, Eq)]
+pub enum Mode {
+    V1,
+    V2Probe,
+}
+
 #[derive(Debug)]
 pub struct Args {
-    pub sender_port: String,
-    pub receiver_port: String,
+    pub mode: Mode,
+    // v1 fields
+    pub sender_port: Option<String>,
+    pub receiver_port: Option<String>,
+    // v2-probe fields
+    pub device_port: Option<String>,
+    pub seed: Option<String>,
     pub baud: u32,
 }
 
@@ -36,17 +54,29 @@ impl Args {
     pub fn parse() -> Result<Self> { Self::parse_from(std::env::args().skip(1)) }
 
     pub fn parse_from(args: impl Iterator<Item = String>) -> Result<Self> {
+        let mut mode = Mode::V1;
         let mut sender_port = None;
         let mut receiver_port = None;
+        let mut device_port = None;
+        let mut seed = None;
         let mut baud = 115_200u32;
 
         let mut args = args;
         while let Some(arg) = args.next() {
             match arg.as_str() {
+                "--mode" =>
+                    mode = match args.next().context("--mode needs a value")?.as_str() {
+                        "v1" => Mode::V1,
+                        "v2-probe" => Mode::V2Probe,
+                        other => bail!("unknown --mode {other} (expected v1 or v2-probe)"),
+                    },
                 "--sender-port" =>
                     sender_port = Some(args.next().context("--sender-port needs a value")?),
                 "--receiver-port" =>
                     receiver_port = Some(args.next().context("--receiver-port needs a value")?),
+                "--device-port" =>
+                    device_port = Some(args.next().context("--device-port needs a value")?),
+                "--seed" => seed = Some(args.next().context("--seed needs a value")?),
                 "--baud" =>
                     baud = args
                         .next()
@@ -57,11 +87,26 @@ impl Args {
             }
         }
 
-        Ok(Self {
-            sender_port: sender_port.context("--sender-port is required")?,
-            receiver_port: receiver_port.context("--receiver-port is required")?,
-            baud,
-        })
+        match mode {
+            Mode::V1 => {
+                if sender_port.is_none() {
+                    bail!("--sender-port is required for --mode v1");
+                }
+                if receiver_port.is_none() {
+                    bail!("--receiver-port is required for --mode v1");
+                }
+            }
+            Mode::V2Probe => {
+                if device_port.is_none() {
+                    bail!("--device-port is required for --mode v2-probe");
+                }
+                if seed.is_none() {
+                    bail!("--seed is required for --mode v2-probe");
+                }
+            }
+        }
+
+        Ok(Self { mode, sender_port, receiver_port, device_port, seed, baud })
     }
 }
 
@@ -160,6 +205,34 @@ where
     }
 
     Ok(())
+}
+
+/// Orchestrates the v2 ShortId/mailbox probe against a single board (see
+/// `harness-device`'s `run_v2_probe`). Unlike `run_v1_roundtrip`, there's
+/// only one board here, not two -- this isn't a live v2 receiver session
+/// (see harness-device's module docs for why that's not possible on
+/// bare-metal), just a round trip through the one v2 primitive that is:
+/// hand the device some seed bytes, get back the ShortId it computed.
+///
+/// Like `run_v1_roundtrip`, the host doesn't independently verify the
+/// payjoin crypto here -- it has no `payjoin` dependency at all, by
+/// design (see module docs) -- it only confirms the framing round trip
+/// happened and reports what the device said. Verifying the returned
+/// ShortId against an independently computed expected value is the
+/// caller's job (or a test's, see below), not this function's.
+pub fn run_v2_probe<T: Read + Write>(device: &mut FramedPort<T>, seed: &[u8]) -> Result<String> {
+    println!("Sending {} byte seed to device...", seed.len());
+    device.write_frame(Command::OriginalPsbt, seed)?;
+
+    println!("Waiting for the device's ShortId...");
+    let (command, payload) = device.read_frame()?;
+    if command != Command::SignedPsbt {
+        bail!("expected SignedPsbt (v2 probe response) from device, got {command:?}");
+    }
+
+    let encoded = String::from_utf8(payload).context("device returned non-UTF-8 ShortId")?;
+    println!("Device reported ShortId: {encoded}");
+    Ok(encoded)
 }
 
 #[cfg(test)]
@@ -348,6 +421,59 @@ mod tests {
     }
 
     #[test]
+    fn run_v2_probe_happy_path() {
+        let mut device = FramedPort::new(ScriptedPort::preloaded_with_frames(&[(
+            Command::SignedPsbt,
+            b"bech32m-encoded-shortid",
+        )]));
+
+        let encoded = run_v2_probe(&mut device, b"some seed bytes").unwrap();
+        assert_eq!(encoded, "bech32m-encoded-shortid");
+
+        // The device should have been sent exactly the seed, framed as
+        // OriginalPsbt (same command v1 uses for "here's your input" --
+        // there's no dedicated v2 opcode yet).
+        let (frame, _) = decode(&device.port.written).unwrap();
+        assert_eq!(frame.command, Command::OriginalPsbt);
+        assert_eq!(frame.payload, b"some seed bytes");
+    }
+
+    #[test]
+    fn run_v2_probe_rejects_wrong_command() {
+        let mut device =
+            FramedPort::new(ScriptedPort::preloaded_with_frames(&[(Command::Status, &[0x00])]));
+
+        let err = run_v2_probe(&mut device, b"seed").unwrap_err();
+        assert!(err.to_string().contains("expected SignedPsbt"));
+    }
+
+    #[test]
+    fn run_v2_probe_rejects_non_utf8_response() {
+        let mut device = FramedPort::new(ScriptedPort::preloaded_with_frames(&[(
+            Command::SignedPsbt,
+            &[0xFF, 0xFE, 0xFD],
+        )]));
+
+        let err = run_v2_probe(&mut device, b"seed").unwrap_err();
+        assert!(err.to_string().contains("non-UTF-8"));
+    }
+
+    #[test]
+    fn args_parse_defaults_to_v1_mode() {
+        let args = Args::parse_from(
+            vec![
+                "--sender-port".to_string(),
+                "/dev/ttyACM0".to_string(),
+                "--receiver-port".to_string(),
+                "/dev/ttyACM1".to_string(),
+            ]
+            .into_iter(),
+        )
+        .unwrap();
+        assert_eq!(args.mode, Mode::V1);
+    }
+
+    #[test]
     fn args_parse_requires_both_ports() {
         let err = Args::parse_from(
             vec!["--sender-port".to_string(), "/dev/ttyACM0".to_string()].into_iter(),
@@ -383,5 +509,47 @@ mod tests {
         )
         .unwrap();
         assert_eq!(args.baud, 9600);
+    }
+
+    #[test]
+    fn args_parse_v2_probe_mode_requires_device_port_and_seed() {
+        let err = Args::parse_from(vec!["--mode".to_string(), "v2-probe".to_string()].into_iter())
+            .unwrap_err();
+        assert!(err.to_string().contains("--device-port"));
+
+        let err = Args::parse_from(
+            vec![
+                "--mode".to_string(),
+                "v2-probe".to_string(),
+                "--device-port".to_string(),
+                "/dev/ttyACM0".to_string(),
+            ]
+            .into_iter(),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("--seed"));
+
+        let args = Args::parse_from(
+            vec![
+                "--mode".to_string(),
+                "v2-probe".to_string(),
+                "--device-port".to_string(),
+                "/dev/ttyACM0".to_string(),
+                "--seed".to_string(),
+                "hello".to_string(),
+            ]
+            .into_iter(),
+        )
+        .unwrap();
+        assert_eq!(args.mode, Mode::V2Probe);
+        assert_eq!(args.device_port.as_deref(), Some("/dev/ttyACM0"));
+        assert_eq!(args.seed.as_deref(), Some("hello"));
+    }
+
+    #[test]
+    fn args_parse_rejects_unknown_mode() {
+        let err =
+            Args::parse_from(vec!["--mode".to_string(), "v3".to_string()].into_iter()).unwrap_err();
+        assert!(err.to_string().contains("unknown --mode"));
     }
 }
