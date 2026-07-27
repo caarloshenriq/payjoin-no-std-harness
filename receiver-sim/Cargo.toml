@@ -1,7 +1,7 @@
 [workspace]
 
 [package]
-name = "sender-sim"
+name = "receiver-sim"
 version = "0.1.0"
 edition = "2021"
 
@@ -17,3 +17,4 @@ bitcoin = { version = "0.32.9", default-features = false }
 serialport = "4.3"
 anyhow = "1.0.81"
 pkg-config = "0.3.30"
+base64 = "0.21.7"
